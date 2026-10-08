@@ -466,7 +466,7 @@
       $("player-cover").dataset.k = b.key;
       if (url) { $("player-cover").src = url; $("player-bg").style.backgroundImage = `url("${url}")`; }
       else { $("player-cover").removeAttribute("src"); $("player-bg").style.backgroundImage = "none"; }
-      $("mini-cover").src = url || "icons/icon-192.png";
+      $("mini-cover").src = url || "icon-192.png";
     }
     if (!seeking) { const v = Math.round((within / len) * 1000); $("seek").value = v; $("seek").style.setProperty("--fill", v / 10 + "%"); }
     $("t-elapsed").textContent = clock(within);
@@ -534,7 +534,7 @@
     const url = await coverUrl(cur.book.key);
     navigator.mediaSession.metadata = new MediaMetadata({
       title: cur.book.info.title, artist: authorOf(cur.book), album: "My Book Reader",
-      artwork: url ? [{ src: url, sizes: "600x600", type: "image/jpeg" }] : [{ src: "icons/icon-512.png", sizes: "512x512", type: "image/png" }],
+      artwork: url ? [{ src: url, sizes: "600x600", type: "image/jpeg" }] : [{ src: "icon-512.png", sizes: "512x512", type: "image/png" }],
     });
     const h = {
       play: () => play(), pause: () => audio.pause(),

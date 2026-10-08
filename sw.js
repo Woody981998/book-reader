@@ -2,8 +2,8 @@
 const VERSION = "mbr-shell-v1";
 const SHELL = [
   "./", "index.html", "styles.css", "app.js", "config.js", "manifest.webmanifest",
-  "fonts/karla.woff2", "fonts/caslon-400.woff2", "fonts/caslon-700.woff2",
-  "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-512.png",
+  "karla.woff2", "caslon-400.woff2", "caslon-700.woff2",
+  "icon-192.png", "icon-512.png", "maskable-512.png",
 ];
 
 self.addEventListener("install", (e) => {
