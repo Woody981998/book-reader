@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>My Book Reader</title>
+  <meta name="description" content="Your audiobooks, on your phone and laptop.">
+  <meta name="theme-color" content="#0B1427" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#F3EFE7" media="(prefers-color-scheme: light)">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="preload" href="fonts/karla.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="fonts/caslon-400.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+  <script src="config.js"></script>
+</head>
+<body>
+  <div id="app">
+    <!-- Sign in -->
+    <section id="welcome" class="welcome" hidden>
+      <div class="welcome-art" aria-hidden="true">
+        <span class="spine s1"></span><span class="spine s2"></span><span class="spine s3"></span><span class="spine s4"></span>
+      </div>
+      <h1 class="welcome-title">My Book Reader</h1>
+      <p class="welcome-text">Your audiobooks from Google Drive, on your phone and your laptop, picking up exactly where you stopped.</p>
+      <button id="signin" class="btn btn-primary">Connect Google Drive</button>
+      <p id="welcome-note" class="small muted"></p>
+    </section>
+
+    <!-- Library -->
+    <main id="library" hidden>
+      <header class="topbar">
+        <h1 class="page-title">Library</h1>
+        <div class="topbar-actions">
+          <span id="sync-status" class="sync-chip" role="status"></span>
+          <button id="refresh" class="icon-btn" aria-label="Refresh library"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4"/></svg></button>
+          <button id="settings-btn" class="icon-btn" aria-label="Settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></button>
+        </div>
+      </header>
+
+      <section id="continue" class="continue" hidden></section>
+
+      <section class="shelf">
+        <div class="shelf-head">
+          <h2 class="section-title">Your books</h2>
+          <div class="filters" role="tablist">
+            <button class="filter active" data-filter="all" role="tab">All</button>
+            <button class="filter" data-filter="downloaded" role="tab">On this device</button>
+          </div>
+        </div>
+        <div id="grid" class="grid"></div>
+        <p id="empty" class="empty" hidden></p>
+      </section>
+      <div class="bottom-space"></div>
+    </main>
+
+    <!-- Mini player -->
+    <button id="mini" class="mini" hidden aria-label="Open player">
+      <img id="mini-cover" class="mini-cover" alt="">
+      <span class="mini-text"><span id="mini-title" class="mini-title"></span><span id="mini-sub" class="mini-sub"></span></span>
+      <span id="mini-toggle" class="mini-toggle" role="button" aria-label="Play or pause"></span>
+      <span class="mini-progress"><span id="mini-bar"></span></span>
+    </button>
+
+    <!-- Full player -->
+    <section id="player" class="player" hidden aria-label="Now playing">
+      <div class="player-bg" id="player-bg"></div>
+      <div class="player-inner">
+        <header class="player-top">
+          <button id="player-close" class="icon-btn" aria-label="Close player"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
+          <span class="player-top-label">Now playing</span>
+          <button id="chapters-btn" class="icon-btn" aria-label="Chapters"><svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg></button>
+        </header>
+        <div class="player-cover-wrap"><img id="player-cover" class="player-cover" alt=""></div>
+        <div class="player-details">
+        <div class="player-meta">
+          <h2 id="player-title" class="player-title"></h2>
+          <p id="player-author" class="player-author"></p>
+          <p id="player-chapter" class="player-chapter"></p>
+        </div>
+        <div class="scrub">
+          <input id="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position in chapter">
+          <div class="scrub-times"><span id="t-elapsed">0:00</span><span id="t-left">0:00</span></div>
+        </div>
+        <div class="controls">
+          <button id="prev-ch" class="ctrl" aria-label="Previous chapter"><svg viewBox="0 0 24 24"><path d="M6 5v14M19 5l-9 7 9 7z"/></svg></button>
+          <button id="back" class="ctrl skip" aria-label="Back 30 seconds"><svg viewBox="0 0 24 24"><path d="M11 5L6 9l5 4"/><path d="M6 9h8a5 5 0 1 1 0 10h-3"/></svg><span>30</span></button>
+          <button id="play" class="ctrl play" aria-label="Play"></button>
+          <button id="fwd" class="ctrl skip" aria-label="Forward 30 seconds"><svg viewBox="0 0 24 24"><path d="M13 5l5 4-5 4"/><path d="M18 9h-8a5 5 0 1 0 0 10h3"/></svg><span>30</span></button>
+          <button id="next-ch" class="ctrl" aria-label="Next chapter"><svg viewBox="0 0 24 24"><path d="M18 5v14M5 5l9 7-9 7z"/></svg></button>
+        </div>
+        <div class="player-extras">
+          <button id="speed-btn" class="pill">1.0×</button>
+          <button id="sleep-btn" class="pill">Sleep timer</button>
+        </div>
+        <p id="book-left" class="book-left"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Bottom sheet (book actions, chapters, speed, sleep, settings) -->
+    <div id="scrim" class="scrim" hidden></div>
+    <section id="sheet" class="sheet" hidden role="dialog" aria-modal="true">
+      <div class="sheet-handle"></div>
+      <div id="sheet-body"></div>
+    </section>
+
+    <div id="toast" class="toast" role="status" hidden></div>
+    <audio id="audio" preload="auto"></audio>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
