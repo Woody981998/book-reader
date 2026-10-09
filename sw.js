@@ -1,5 +1,5 @@
 // Keeps the app itself available offline. Books and covers are stored separately by app.js.
-const VERSION = "mbr-shell-v1";
+const VERSION = "mbr-shell-v2";
 const SHELL = [
   "./", "index.html", "styles.css", "app.js", "config.js", "manifest.webmanifest",
   "karla.woff2", "caslon-400.woff2", "caslon-700.woff2",

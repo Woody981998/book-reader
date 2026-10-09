@@ -1,5 +1,6 @@
-/* My Book Reader: plays your converted audiobooks from Google Drive, offline, and keeps your
-   place in sync between devices through a small file in your Drive's private app folder. */
+/* My Book Reader: plays your converted audiobooks from Google Drive. It keeps the next few hours
+   saved on the device for offline listening, clears what you have heard, and keeps your place in
+   sync between devices through a small file in your Drive's private app folder. */
 (() => {
   "use strict";
   const CFG = window.APP_CONFIG || {};
@@ -28,7 +29,8 @@
     const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
     return h ? `${h}h ${m}m` : `${Math.max(1, m)}m`;
   };
-  const mb = (bytes) => bytes ? `${Math.round(bytes / 1048576)} MB` : "";
+  const mb = (bytes) => !bytes ? "" : bytes < 1048576 ? "under 1 MB" : `${Math.round(bytes / 1048576)} MB`;
+  const hoursText = (h, sentence) => sentence ? (h === 1 ? "The next hour is" : `The next ${h} hours are`) : (h === 1 ? "the next hour" : `the next ${h} hours`);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const deviceId = store.get("device") || (() => { const id = Math.random().toString(36).slice(2, 10); store.set("device", id); return id; })();
 
@@ -43,11 +45,11 @@
   const S = {
     books: store.get("books", []),
     progress: store.get("progress", {}),
-    downloaded: store.get("downloaded", {}),
-    settings: Object.assign({ speed: 1, theme: "auto" }, store.get("settings", {})),
+    local: store.get("local", {}),       // book key -> { chapter file -> bytes } saved on this device
+    pinned: store.get("pinned", {}),     // books saved whole for a trip
+    settings: Object.assign({ speed: 1, theme: "auto", ahead: 3 }, store.get("settings", {})),
     current: store.get("current", null),
     filter: "all",
-    dl: {},          // key -> fraction while downloading
     token: null, tokenExp: 0,
     sleep: null,     // {until} or {chapterEnd}
     remoteId: null,
@@ -138,8 +140,10 @@
     return f[0] || null;
   }
 
+
   // ---------- library ----------
-  const COVERS = "mbr-covers", BOOKS = "mbr-books";
+  // Each book is a folder inside Audiobooks/Ready with book.json, cover.jpg and one small file per chapter.
+  const COVERS = "mbr-covers", CHAPTER_CACHE = "mbr-chapters";
   const coverUrls = {};
   async function coverUrl(key) {
     if (key in coverUrls) return coverUrls[key];
@@ -155,39 +159,173 @@
     if (!root) { chip(""); renderGrid(`There is no "${esc(CFG.DRIVE_FOLDER)}" folder in your Google Drive yet. Run the converter once and it will appear.`); return; }
     const ready = await findFolder(CFG.READY_FOLDER || "Ready", root.id);
     if (!ready) { chip(""); renderGrid(`Your Drive has an "${esc(CFG.DRIVE_FOLDER)}" folder but no "Ready" folder inside it yet.`); return; }
-    const files = await listAll(`'${ready.id}' in parents and trashed=false`, "id,name,size,modifiedTime");
-    const groups = {};
-    for (const f of files) {
-      const m = f.name.match(/^(.*)\.(m4b|json|jpg)$/i);
-      if (!m) continue;
-      (groups[m[1]] ||= {})[m[2].toLowerCase()] = f;
+    const folders = (await listAll(`'${ready.id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`, "id,name"))
+      .filter((f) => !f.name.endsWith("(saving)"));
+    const children = {};
+    for (let i = 0; i < folders.length; i += 25) {
+      const part = folders.slice(i, i + 25);
+      const files = await listAll(`(${part.map((f) => `'${f.id}' in parents`).join(" or ")}) and trashed=false`, "id,name,size,modifiedTime,parents");
+      for (const f of files) (children[f.parents[0]] ||= {})[f.name] = f;
     }
     const books = [];
-    for (const [key, g] of Object.entries(groups)) {
-      if (!g.m4b) continue;
-      const old = bookBy(key) || {};
-      let info = old.info && old.infoMod === g.json?.modifiedTime ? old.info : null;
-      if (!info && g.json) { try { info = await (await gfetch(`${API}/files/${g.json.id}?alt=media`)).json(); } catch { info = null; } }
-      info ||= { title: key, author: "", duration: 0, chapters: [] };
-      if (g.jpg && old.coverMod !== g.jpg.modifiedTime) {
+    for (const folder of folders) {
+      const kids = children[folder.id] || {};
+      const json = kids["book.json"];
+      if (!json) continue;
+      const key = folder.name, old = bookBy(key) || {};
+      let info = old.info && old.infoMod === json.modifiedTime ? old.info : null;
+      if (!info) { try { info = await (await gfetch(`${API}/files/${json.id}?alt=media`)).json(); } catch { continue; } }
+      const jpg = info.cover && kids[info.cover];
+      if (jpg && old.coverMod !== jpg.modifiedTime) {
         try {
-          const blob = await (await gfetch(`${API}/files/${g.jpg.id}?alt=media`)).blob();
+          const blob = await (await gfetch(`${API}/files/${jpg.id}?alt=media`)).blob();
           await (await caches.open(COVERS)).put("covers/" + encodeURIComponent(key), new Response(blob, { headers: { "Content-Type": "image/jpeg" } }));
           if (coverUrls[key]) URL.revokeObjectURL(coverUrls[key]);
           delete coverUrls[key];
         } catch { /* cover is optional */ }
       }
-      books.push({
-        key, info, infoMod: g.json?.modifiedTime || null, coverMod: g.jpg?.modifiedTime || old.coverMod || null,
-        m4b: { id: g.m4b.id, size: Number(g.m4b.size || 0), modified: g.m4b.modifiedTime },
-      });
+      const files = {};
+      for (const c of info.chapters || []) if (kids[c.file]) files[c.file] = { id: kids[c.file].id, size: Number(kids[c.file].size || c.size || 0) };
+      books.push({ key, info, infoMod: json.modifiedTime, coverMod: jpg?.modifiedTime || old.coverMod || null, files });
     }
     books.sort((a, b) => a.info.title.localeCompare(b.info.title));
     S.books = books; saveBooks();
     renderLibrary();
     chip("");
+    keepAhead();
   }
   const authorOf = (b) => (b.info.author && b.info.author !== "Unknown" ? b.info.author : "");
+  const bookSize = (b) => (b.info.chapters || []).reduce((n, c) => n + (b.files[c.file]?.size || c.size || 0), 0);
+
+  // ---------- chapters stored on this device ----------
+  const dirName = (key) => key.replace(/[\\/:*?"<>|]/g, "_");
+  const isLocal = (key, file) => !!S.local[key]?.[file];
+  const saveLocalIndex = () => store.set("local", S.local);
+  let writeCheck = null;
+  function canWriteFiles() {
+    return (writeCheck ||= (async () => {
+      try {
+        if (!navigator.storage?.getDirectory) return false;
+        const dir = await navigator.storage.getDirectory();
+        const fh = await dir.getFileHandle(".write-test", { create: true });
+        if (!fh.createWritable) return false;
+        const w = await fh.createWritable(); await w.write(new Uint8Array([1])); await w.close();
+        await dir.removeEntry(".write-test");
+        return true;
+      } catch { return false; }
+    })());
+  }
+  async function writeLocal(key, file, blob) {
+    if (await canWriteFiles()) {
+      const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(dirName(key), { create: true });
+      const w = await (await dir.getFileHandle(file, { create: true })).createWritable();
+      await w.write(blob); await w.close();
+    } else {
+      await (await caches.open(CHAPTER_CACHE)).put(`ch/${encodeURIComponent(key)}/${file}`, new Response(blob, { headers: { "Content-Type": "audio/webm" } }));
+    }
+    (S.local[key] ||= {})[file] = blob.size; saveLocalIndex();
+  }
+  async function readLocal(key, file) {
+    if (await canWriteFiles()) {
+      const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(dirName(key));
+      return (await dir.getFileHandle(file)).getFile();
+    }
+    const r = await (await caches.open(CHAPTER_CACHE)).match(`ch/${encodeURIComponent(key)}/${file}`);
+    if (!r) throw new Error("missing");
+    return r.blob();
+  }
+  async function deleteLocal(key, file) {
+    try {
+      if (await canWriteFiles()) await (await (await navigator.storage.getDirectory()).getDirectoryHandle(dirName(key))).removeEntry(file);
+      else await (await caches.open(CHAPTER_CACHE)).delete(`ch/${encodeURIComponent(key)}/${file}`);
+    } catch { /* already gone */ }
+    if (S.local[key]) { delete S.local[key][file]; if (!Object.keys(S.local[key]).length) delete S.local[key]; saveLocalIndex(); }
+  }
+  async function removeBookLocal(key) {
+    for (const f of Object.keys(S.local[key] || {})) await deleteLocal(key, f);
+    try { if (await canWriteFiles()) await (await navigator.storage.getDirectory()).removeEntry(dirName(key), { recursive: true }); } catch { /* ignore */ }
+    delete S.local[key]; delete S.pinned[key]; saveLocalIndex(); store.set("pinned", S.pinned);
+  }
+  const inflight = {};
+  function fetchChapter(book, i) {
+    const c = book.info.chapters[i], id = book.files[c.file]?.id, k = book.key + "/" + c.file;
+    if (isLocal(book.key, c.file)) return Promise.resolve();
+    if (!id) return Promise.reject(new Error("missing on Drive"));
+    return (inflight[k] ||= (async () => {
+      try {
+        const blob = await (await gfetch(`${API}/files/${id}?alt=media`)).blob();
+        await writeLocal(book.key, c.file, blob);
+      } finally { delete inflight[k]; }
+    })());
+  }
+  const localBytes = (key) => Object.values(S.local[key] || {}).reduce((a, b) => a + b, 0);
+  function aheadSeconds(book, fromTime) {
+    // How much listening is saved on this device from fromTime onward, without gaps
+    const chs = book.info.chapters || []; let i = chapterIndex(book, fromTime), secs = 0;
+    for (; i < chs.length && isLocal(book.key, chs[i].file); i++) secs += chs[i].end - Math.max(chs[i].start, fromTime);
+    return secs;
+  }
+
+  // Keep the next few hours of the current book on the device and clear what you've already heard.
+  let keeping = false, keepAgain = false;
+  async function keepAhead() {
+    if (keeping) { keepAgain = true; return; }
+    keeping = true;
+    try {
+      do {
+        keepAgain = false;
+        if (navigator.onLine && tokenValid()) navigator.storage?.persist?.();
+        const want = (S.settings.ahead || 3) * 3600;
+        // what each book should keep
+        const keep = {};
+        for (const b of S.books) {
+          const chs = b.info.chapters || []; if (!chs.length) continue;
+          const pos = b.key === cur?.book.key ? bookTime() : (S.progress[b.key]?.pos || 0);
+          const first = chapterIndex(b, pos), set = new Set();
+          if (S.pinned[b.key]) chs.forEach((c) => set.add(c.file));
+          else if (b.key === S.current) {
+            if (first > 0) set.add(chs[first - 1].file); // the chapter before, for rewinding
+            let secs = 0;
+            for (let i = first; i < chs.length && (secs < want || i === first); i++) { set.add(chs[i].file); secs += chs[i].end - chs[i].start; }
+          } else if (S.progress[b.key] && !S.progress[b.key].done) set.add(chs[first].file); // enough to resume offline
+          keep[b.key] = set;
+        }
+        // clear what isn't needed (also books that are no longer in Drive)
+        for (const key of Object.keys(S.local)) {
+          for (const f of Object.keys(S.local[key])) if (!keep[key]?.has(f)) await deleteLocal(key, f);
+        }
+        // fetch what's missing, in listening order
+        if (navigator.onLine && tokenValid()) {
+          const order = [];
+          const curBook = bookBy(S.current);
+          if (curBook && keep[curBook.key]) (curBook.info.chapters || []).forEach((c, i) => keep[curBook.key].has(c.file) && order.push([curBook, i]));
+          for (const b of S.books) if (b !== curBook && keep[b.key]) (b.info.chapters || []).forEach((c, i) => keep[b.key].has(c.file) && order.push([b, i]));
+          for (const [b, i] of order) {
+            if (!navigator.onLine || !tokenValid() || keepAgain) break;
+            if (isLocal(b.key, b.info.chapters[i].file)) continue;
+            try { await fetchChapter(b, i); } catch (e) { if (e instanceof AuthError) { chip("Tap to sync", true); break; } }
+            paintOffline();
+          }
+        }
+        paintOffline();
+      } while (keepAgain);
+    } finally { keeping = false; }
+  }
+  function paintOffline() {
+    if (!$("player").hidden) updatePlayerUI();
+    const el = document.querySelector(".continue-offline");
+    if (el) { const b = bookBy(el.dataset.key); if (b) el.textContent = offlineLabel(b); }
+    document.querySelectorAll(".book[data-key]").forEach((n) => {
+      const b = bookBy(n.dataset.key); const badge = n.querySelector(".book-badge");
+      const full = b && S.pinned[b.key] && (b.info.chapters || []).every((c) => isLocal(b.key, c.file));
+      if (badge) badge.hidden = !full;
+    });
+  }
+  function offlineLabel(b) {
+    const pos = b.key === cur?.book.key ? bookTime() : (S.progress[b.key]?.pos || 0);
+    const a = aheadSeconds(b, pos);
+    return a > 60 ? `${human(a)} saved for offline` : navigator.onLine ? "Plays online" : "Not saved for offline";
+  }
 
   // ---------- rendering ----------
   function pct(key) {
@@ -196,11 +334,17 @@
     if (!p || !d) return 0;
     return p.done ? 100 : Math.min(100, Math.round((p.pos / d) * 100));
   }
-  function chapterAt(book, t) {
+  function chapterIndex(book, t) {
     const ch = book?.info.chapters || [];
     let i = 0;
     for (let j = 0; j < ch.length; j++) if (ch[j].start <= t + 0.25) i = j;
-    return ch.length ? { i, ...ch[i] } : null;
+    return i;
+  }
+  function chapterAt(book, t) {
+    const ch = book?.info.chapters || [];
+    if (!ch.length) return null;
+    const i = chapterIndex(book, t);
+    return { i, ...ch[i] };
   }
   function coverHtml(b, url) {
     return url ? `<img src="${url}" alt="" loading="lazy">`
@@ -213,8 +357,9 @@
     const key = S.current && bookBy(S.current) && !S.progress[S.current]?.done ? S.current : keys[0];
     if (!key) { el.hidden = true; return; }
     const b = bookBy(key), p = S.progress[key] || { pos: 0 }, url = await coverUrl(key);
-    const ch = chapterAt(b, p.pos);
-    const left = (b.info.duration || 0) - p.pos;
+    const pos = key === cur?.book.key ? bookTime() : p.pos;
+    const ch = chapterAt(b, pos);
+    const left = (b.info.duration || 0) - pos;
     el.hidden = false;
     el.innerHTML = `<h2 class="section-title" style="margin-bottom:12px">Continue listening</h2>
       <button class="continue-card" data-key="${esc(key)}">
@@ -222,31 +367,30 @@
         <span>
           <p class="continue-title">${esc(b.info.title)}</p>
           <p class="continue-ch">${esc(ch ? ch.title : authorOf(b))}${b.info.duration ? ` · ${human(left)} left` : ""}</p>
-          <span class="continue-row"><span class="resume">${ICON.play}${p.pos > 5 ? "Resume" : "Play"}</span><span class="bar"><span style="width:${pct(key)}%"></span></span></span>
+          <span class="continue-row"><span class="resume">${ICON.play}${pos > 5 ? "Resume" : "Play"}</span><span class="bar"><span style="width:${pct(key)}%"></span></span></span>
+          <p class="continue-offline small muted" data-key="${esc(key)}">${esc(offlineLabel(b))}</p>
         </span>
       </button>`;
-    el.querySelector(".continue-card").onclick = () => tapBook(key, true);
+    el.querySelector(".continue-card").onclick = () => openBook(key);
   }
   async function renderGrid(emptyMsg) {
     const grid = $("grid"), empty = $("empty");
     let list = S.books;
-    if (S.filter === "downloaded") list = list.filter((b) => S.downloaded[b.key]);
+    if (S.filter === "downloaded") list = list.filter((b) => Object.keys(S.local[b.key] || {}).length);
     if (!list.length) {
       grid.innerHTML = "";
       empty.hidden = false;
       empty.innerHTML = emptyMsg || (S.filter === "downloaded"
-        ? "Nothing is downloaded on this device yet. Open a book and tap Download to listen offline."
+        ? "Nothing is saved on this device yet. Start a book and the next few hours are saved automatically."
         : "No books yet. Audiobooks you convert into Google Drive, in Audiobooks › Ready, will show up here.");
       return;
     }
     empty.hidden = true;
     const html = await Promise.all(list.map(async (b) => {
-      const url = await coverUrl(b.key), p = pct(b.key), dl = S.dl[b.key];
-      let badge = "";
-      if (dl !== undefined) badge = `<span class="book-badge ring" style="--p:${Math.round(dl * 100)}"></span>`;
-      else if (S.downloaded[b.key]) badge = `<span class="book-badge" title="On this device">${ICON.check}</span>`;
+      const url = await coverUrl(b.key), p = pct(b.key);
+      const full = S.pinned[b.key] && (b.info.chapters || []).every((c) => isLocal(b.key, c.file));
       return `<button class="book" data-key="${esc(b.key)}">
-        <span class="book-cover">${coverHtml(b, url)}${badge}</span>
+        <span class="book-cover">${coverHtml(b, url)}<span class="book-badge" title="Whole book on this device" ${full ? "" : "hidden"}>${ICON.check}</span></span>
         ${p ? `<span class="bar"><span style="width:${p}%"></span></span>` : ""}
         <p class="book-title">${esc(b.info.title)}</p>
         <p class="book-author">${esc(authorOf(b) || (b.info.duration ? human(b.info.duration) : ""))}</p>
@@ -267,203 +411,152 @@
   $("scrim").onclick = closeSheet;
   let sheetBook = null;
 
-  async function tapBook(key, fromContinue = false) {
-    if (S.downloaded[key] && (fromContinue || S.current === key)) return openBook(key);
+  async function tapBook(key) {
+    if (S.current === key && cur) return openBook(key);
     const b = bookBy(key); if (!b) return;
     sheetBook = key;
     const url = await coverUrl(key), p = S.progress[key];
-    const isDl = !!S.downloaded[key], busy = S.dl[key] !== undefined;
+    const size = bookSize(b), have = localBytes(key);
     const info = [authorOf(b), b.info.duration ? human(b.info.duration) : "", b.info.chapters?.length ? `${b.info.chapters.length} chapters` : ""].filter(Boolean).join(" · ");
     openSheet(`
       <div class="sheet-book">${coverHtml(b, url)}<div><h3>${esc(b.info.title)}</h3><p class="sheet-sub" style="margin:0">${esc(info)}</p></div></div>
       <div class="sheet-actions">
-        ${isDl ? `<button class="btn btn-primary" data-act="play">${p?.pos > 5 && !p.done ? "Resume" : "Play"}</button>` : ""}
-        ${!isDl && !busy ? `<button class="btn btn-primary" data-act="download">Download to this device${b.m4b.size ? ` (${mb(b.m4b.size)})` : ""}</button>` : ""}
-        ${busy ? `<div><div class="progress-line"><span id="sheet-dl" style="width:${Math.round(S.dl[key] * 100)}%"></span></div><p class="small muted" id="sheet-dl-text">Downloading…</p></div>` : ""}
-        ${!isDl && !busy ? `<p class="small muted" style="margin:0;text-align:center">Downloading lets you listen offline. Use Wi-Fi for big books.</p>` : ""}
+        <button class="btn btn-primary" data-act="play">${p?.pos > 5 && !p.done ? "Resume" : "Play"}</button>
+        <p class="small muted" style="margin:0;text-align:center">${hoursText(S.settings.ahead, true)} saved on this device automatically while you listen.</p>
+        ${S.pinned[key]
+          ? `<button class="btn btn-ghost" data-act="unpin">Only keep ${hoursText(S.settings.ahead)} on this device</button>`
+          : `<button class="btn btn-ghost" data-act="pin">Save the whole book for a trip${size ? ` (${mb(size)})` : ""}</button>`}
         ${p?.pos > 5 ? `<button class="btn btn-ghost" data-act="restart">Start from the beginning</button>` : ""}
         ${p && !p.done ? `<button class="btn btn-ghost" data-act="finish">Mark as finished</button>` : ""}
-        ${isDl ? `<button class="btn btn-danger" data-act="remove">Remove from this device</button>` : ""}
+        ${have ? `<button class="btn btn-danger" data-act="remove">Remove from this device (${mb(have)})</button>` : ""}
       </div>`, (root) => {
       root.querySelectorAll("[data-act]").forEach((btn) => (btn.onclick = () => bookAction(key, btn.dataset.act)));
     });
   }
   async function bookAction(key, act) {
     if (act === "play") { closeSheet(); return openBook(key); }
-    if (act === "download") { downloadBook(key); return tapBook(key); }
+    if (act === "pin") {
+      if (!navigator.onLine) return toast("Connect to the internet to save the whole book.");
+      if (!tokenValid()) { try { await signIn(); } catch { return toast("Google sign-in did not finish. Try again."); } }
+      S.pinned[key] = true; store.set("pinned", S.pinned); closeSheet();
+      toast("Saving the whole book in the background"); keepAhead(); return;
+    }
+    if (act === "unpin") { delete S.pinned[key]; store.set("pinned", S.pinned); closeSheet(); keepAhead(); toast("Keeping only the next few hours"); return; }
     if (act === "remove") {
       if (cur?.book.key === key) { audio.pause(); audio.removeAttribute("src"); audio.load(); cur = null; updatePlayerUI(); }
-      await removeDownload(key); closeSheet(); renderLibrary(); toast("Removed from this device"); return;
+      if (S.current === key) { S.current = null; store.set("current", null); }
+      await removeBookLocal(key); closeSheet(); renderLibrary(); toast("Removed from this device"); return;
     }
     if (act === "restart" || act === "finish") {
       S.progress[key] = { pos: 0, updated: Date.now(), dur: bookBy(key).info.duration, done: act === "finish" };
       saveProgress();
-      if (cur?.book.key === key) audio.currentTime = 0;
-      closeSheet(); renderLibrary(); pushSoon(); return;
+      if (cur?.book.key === key) seekBook(0);
+      closeSheet(); renderLibrary(); pushSoon(); keepAhead(); return;
     }
   }
 
-  // ---------- downloads (stored in the browser's private file storage) ----------
-  const fname = (key) => key.replace(/[\\/:*?"<>|]/g, "_") + ".m4b";
-  let writeCheck = null;
-  function canWriteFiles() {
-    return (writeCheck ||= (async () => {
-      try {
-        if (!navigator.storage?.getDirectory) return false;
-        const dir = await navigator.storage.getDirectory();
-        const fh = await dir.getFileHandle(".write-test", { create: true });
-        if (!fh.createWritable) return false;
-        const w = await fh.createWritable(); await w.write(new Uint8Array([1])); await w.close();
-        await dir.removeEntry(".write-test");
-        return true;
-      } catch { return false; }
-    })());
-  }
-  async function downloadBook(key) {
-    const b = bookBy(key); if (!b || S.dl[key] !== undefined) return;
-    if (!navigator.onLine) return toast("You are offline. Connect to download.");
-    if (!tokenValid()) { try { await signIn(); } catch { return toast("Google sign-in did not finish. Try again."); } }
-    navigator.storage?.persist?.();
-    S.dl[key] = 0; renderGrid();
-    try {
-      const r = await gfetch(`${API}/files/${b.m4b.id}?alt=media`);
-      const total = b.m4b.size || Number(r.headers.get("Content-Length")) || 0;
-      let got = 0, lastPaint = 0;
-      const onChunk = (n) => {
-        got += n;
-        if (total && Date.now() - lastPaint > 400) {
-          lastPaint = Date.now(); S.dl[key] = got / total;
-          const ring = document.querySelector(`.book[data-key="${CSS.escape(key)}"] .ring`);
-          if (ring) ring.style.setProperty("--p", Math.round(S.dl[key] * 100));
-          if (sheetBook === key && $("sheet-dl")) { $("sheet-dl").style.width = `${Math.round(S.dl[key] * 100)}%`; $("sheet-dl-text").textContent = `Downloading… ${mb(got)} of ${mb(total)}`; }
-        }
-      };
-      const where = (await canWriteFiles()) ? "opfs" : "cache";
-      if (where === "opfs") {
-        const dir = await navigator.storage.getDirectory();
-        const fh = await dir.getFileHandle(fname(key), { create: true });
-        const w = await fh.createWritable();
-        const reader = r.body.getReader();
-        try {
-          for (;;) { const { done, value } = await reader.read(); if (done) break; await w.write(value); onChunk(value.byteLength); }
-          await w.close();
-        } catch (e) { try { await w.abort(); await dir.removeEntry(fname(key)); } catch { /* ignore */ } throw e; }
-      } else {
-        // Older browsers: keep the file in the browser's cache storage instead
-        const counted = r.body.pipeThrough(new TransformStream({ transform(c, ctl) { onChunk(c.byteLength); ctl.enqueue(c); } }));
-        await (await caches.open(BOOKS)).put("books/" + encodeURIComponent(key), new Response(counted, { headers: { "Content-Type": "audio/mp4" } }));
-      }
-      S.downloaded[key] = { where, size: total, modified: b.m4b.modified };
-      store.set("downloaded", S.downloaded);
-      delete S.dl[key];
-      toast(`"${b.info.title}" is ready to play offline`);
-    } catch (e) {
-      delete S.dl[key];
-      toast(e instanceof AuthError ? "Google sign-in expired. Tap Download again." : "Download stopped. Check your connection and try again.");
-    }
-    renderLibrary();
-    if (sheetBook === key) tapBook(key);
-  }
-  async function removeDownload(key) {
-    const d = S.downloaded[key];
-    try {
-      if (d?.where === "cache") await (await caches.open(BOOKS)).delete("books/" + encodeURIComponent(key));
-      else await (await navigator.storage.getDirectory()).removeEntry(fname(key));
-    } catch { /* already gone */ }
-    delete S.downloaded[key]; store.set("downloaded", S.downloaded);
-  }
-  async function localFileUrl(key) {
-    const d = S.downloaded[key];
-    if (d?.where === "cache") {
-      const r = await (await caches.open(BOOKS)).match("books/" + encodeURIComponent(key));
-      if (!r) throw new Error("missing");
-      return URL.createObjectURL(await r.blob());
-    }
-    const fh = await (await navigator.storage.getDirectory()).getFileHandle(fname(key));
-    return URL.createObjectURL(await fh.getFile());
-  }
-
-  // ---------- player ----------
-  let cur = null; // { book, url }
+  // ---------- player (one small file per chapter) ----------
+  let cur = null; // { book, i, url }
   let lastLocalSave = 0, lastPush = 0;
+  const bookTime = () => (cur ? (cur.book.info.chapters[cur.i]?.start || 0) + (audio.currentTime || 0) : 0);
   function setPos(key, pos, extra = {}) {
     const b = bookBy(key);
-    S.progress[key] = { ...(S.progress[key] || {}), pos, updated: Date.now(), dur: b?.info.duration || audio.duration || 0, done: false, ...extra };
+    S.progress[key] = { ...(S.progress[key] || {}), pos, updated: Date.now(), dur: b?.info.duration || 0, done: false, ...extra };
     saveProgress();
   }
   function once(el, ev) { return new Promise((r) => el.addEventListener(ev, r, { once: true })); }
 
-  async function loadBook(key) {
-    const b = bookBy(key);
-    if (cur?.book.key === key) return true;
-    if (cur) { setPos(cur.book.key, audio.currentTime); URL.revokeObjectURL(cur.url); }
-    let url;
-    try { url = await localFileUrl(key); }
-    catch {
-      await removeDownload(key); renderLibrary();
-      toast("That download was cleared by your phone. Download it again."); return false;
+  // Loads chapter i of a book and moves to `offset` seconds into it.
+  async function loadChapter(book, i, offset, autoplay) {
+    const c = book.info.chapters[i];
+    if (!c) return false;
+    if (!isLocal(book.key, c.file)) {
+      if (!navigator.onLine) { toast("This part isn't saved on this device. Connect to the internet to play it.", 4500); return false; }
+      if (!tokenValid()) { chip("Tap to sync", true); toast("Tap \"Tap to sync\" at the top to reconnect Google, then press play.", 4500); return false; }
+      $("player-chapter").textContent = "Loading…";
+      try { await fetchChapter(book, i); } catch { toast("Could not load this chapter. Check your connection.", 4000); return false; }
     }
-    cur = { book: b, url };
+    let blob;
+    try { blob = await readLocal(book.key, c.file); }
+    catch { await deleteLocal(book.key, c.file); return loadChapter(book, i, offset, autoplay); }
+    const url = URL.createObjectURL(blob);
+    if (cur?.url) URL.revokeObjectURL(cur.url);
+    cur = { book, i, url };
     audio.src = url;
-    S.current = key; store.set("current", key);
-    const ok = await Promise.race([
-      once(audio, "loadedmetadata").then(() => true),
-      once(audio, "error").then(() => false),
-      sleep(15000).then(() => false),
-    ]);
-    if (!ok) {
-      URL.revokeObjectURL(url); cur = null; audio.removeAttribute("src");
-      toast("This book could not be opened on this device. Try removing and downloading it again.", 5000);
-      updatePlayerUI(); return false;
-    }
-    if (!b.info.duration && audio.duration) { b.info.duration = audio.duration; saveBooks(); }
-    const p = S.progress[key];
-    audio.currentTime = p && !p.done ? p.pos : 0;
+    const ok = await Promise.race([once(audio, "loadedmetadata").then(() => true), once(audio, "error").then(() => false), sleep(15000).then(() => false)]);
+    if (!ok) { toast("This chapter could not be opened on this device.", 4000); return false; }
+    audio.currentTime = Math.max(0, Math.min(offset, (audio.duration || c.end - c.start) - 0.3));
     audio.playbackRate = S.settings.speed;
-    setMediaSession();
-    updatePlayerUI();
+    setMediaSession(); updatePlayerUI();
+    if (autoplay) play();
+    keepAhead();
     return true;
+  }
+  async function loadBook(key, autoplay) {
+    const b = bookBy(key);
+    if (!b || !(b.info.chapters || []).length) return false;
+    if (cur?.book.key === key) { if (autoplay && audio.paused) play(); return true; }
+    if (cur) { setPos(cur.book.key, bookTime()); audio.pause(); }
+    const p = S.progress[key], pos = p && !p.done ? p.pos : 0;
+    S.current = key; store.set("current", key);
+    const i = chapterIndex(b, pos);
+    return loadChapter(b, i, pos - b.info.chapters[i].start, autoplay);
   }
   async function openBook(key, { autoplay = true } = {}) {
     closeSheet();
-    if (!(await loadBook(key))) return;
-    openPlayer();
-    if (autoplay) play();
+    openPlayerShell(key);
+    if (!(await loadBook(key, autoplay))) { updatePlayerUI(); return; }
     if (tokenValid()) syncNow({ quiet: true });
   }
   function play() { audio.playbackRate = S.settings.speed; audio.play().catch(() => toast("Tap play to start")); }
   function toggle() { if (!cur) return; audio.paused ? play() : audio.pause(); }
-  function seekTo(t) { if (!cur) return; audio.currentTime = Math.max(0, Math.min(t, (audio.duration || 1e9) - 0.5)); updatePlayerUI(); }
+  async function seekBook(t) {
+    if (!cur) return;
+    const b = cur.book, d = b.info.duration || 0;
+    t = Math.max(0, Math.min(t, d - 0.5));
+    const i = chapterIndex(b, t), c = b.info.chapters[i];
+    if (i === cur.i) { audio.currentTime = t - c.start; updatePlayerUI(); return; }
+    const wasPlaying = !audio.paused;
+    setPos(b.key, t);
+    await loadChapter(b, i, t - c.start, wasPlaying);
+  }
   function jumpChapter(dir) {
     if (!cur) return;
-    const chs = cur.book.info.chapters || [];
-    if (!chs.length) return seekTo(audio.currentTime + dir * SKIP);
-    const c = chapterAt(cur.book, audio.currentTime);
-    if (dir < 0 && audio.currentTime - c.start > 4) return seekTo(c.start);
-    const n = Math.max(0, Math.min(chs.length - 1, c.i + dir));
-    seekTo(chs[n].start);
+    const chs = cur.book.info.chapters;
+    if (dir < 0 && audio.currentTime > 4) return seekBook(chs[cur.i].start);
+    const n = Math.max(0, Math.min(chs.length - 1, cur.i + dir));
+    seekBook(chs[n].start + 0.01);
   }
-  function openPlayer() { if ($("player").hidden) history.pushState({ o: 1 }, ""); $("player").hidden = false; updatePlayerUI(); }
+  function openPlayerShell(key) {
+    if ($("player").hidden) history.pushState({ o: 1 }, "");
+    $("player").hidden = false;
+    if (!cur || cur.book.key !== key) {
+      const b = bookBy(key);
+      $("player-title").textContent = b?.info.title || "";
+      $("player-author").textContent = b ? authorOf(b) : "";
+      $("player-chapter").textContent = "Loading…";
+      coverUrl(key).then((u) => { $("player-cover").dataset.k = key; if (u) { $("player-cover").src = u; $("player-bg").style.backgroundImage = `url("${u}")`; } });
+    }
+    updatePlayerUI();
+  }
+  function openPlayer() { if (cur) openPlayerShell(cur.book.key); }
   function closePlayer() { $("player").hidden = true; renderLibrary(); updatePlayerUI(); }
 
   async function updatePlayerUI() {
     const has = !!cur;
     $("mini").hidden = !has || !$("player").hidden;
     if (!has) return;
-    const b = cur.book, t = audio.currentTime || 0, d = audio.duration || b.info.duration || 0;
-    const ch = chapterAt(b, t);
-    const start = ch ? ch.start : 0, end = ch ? Math.min(ch.end, d || ch.end) : d;
-    const within = Math.max(0, t - start), len = Math.max(1, end - start);
+    const b = cur.book, c = b.info.chapters[cur.i], t = bookTime(), d = b.info.duration || 0;
+    const within = audio.currentTime || 0, len = Math.max(1, audio.duration || (c.end - c.start));
     const rate = S.settings.speed;
     const playing = !audio.paused;
     const url = await coverUrl(b.key);
-    // full player
     $("player-title").textContent = b.info.title;
     $("player-author").textContent = authorOf(b);
-    $("player-chapter").textContent = ch ? ch.title : "";
-    $("player-chapter").hidden = !ch;
-    if ($("player-cover").dataset.k !== b.key) {
-      $("player-cover").dataset.k = b.key;
+    $("player-chapter").textContent = c.title;
+    $("player-chapter").hidden = false;
+    if ($("player-cover").dataset.k !== b.key || ($("mini-cover").dataset.k !== b.key)) {
+      $("player-cover").dataset.k = b.key; $("mini-cover").dataset.k = b.key;
       if (url) { $("player-cover").src = url; $("player-bg").style.backgroundImage = `url("${url}")`; }
       else { $("player-cover").removeAttribute("src"); $("player-bg").style.backgroundImage = "none"; }
       $("mini-cover").src = url || "icon-192.png";
@@ -478,10 +571,11 @@
     if (S.sleep?.until) { sl.textContent = `Sleep in ${Math.max(1, Math.ceil((S.sleep.until - Date.now()) / 60000))}m`; sl.classList.add("on"); }
     else if (S.sleep?.chapterEnd) { sl.textContent = "Sleep at chapter end"; sl.classList.add("on"); }
     else { sl.textContent = "Sleep timer"; sl.classList.remove("on"); }
-    $("book-left").textContent = d ? `${human((d - t) / rate)} left in the book${rate !== 1 ? ` at ${rate}×` : ""}` : "";
-    // mini player
+    const ahead = aheadSeconds(b, t);
+    $("book-left").textContent = (d ? `${human((d - t) / rate)} left in the book${rate !== 1 ? ` at ${rate}×` : ""}` : "") +
+      (ahead > 60 ? ` · ${human(ahead)} saved for offline` : "");
     $("mini-title").textContent = b.info.title;
-    $("mini-sub").textContent = ch ? ch.title : authorOf(b);
+    $("mini-sub").textContent = c.title;
     $("mini-toggle").innerHTML = playing ? ICON.pause : ICON.play;
     $("mini-bar").style.width = d ? `${(t / d) * 100}%` : "0";
   }
@@ -491,16 +585,10 @@
     seeking = true;
     const v = Number($("seek").value); $("seek").style.setProperty("--fill", v / 10 + "%");
     if (!cur) return;
-    const ch = chapterAt(cur.book, audio.currentTime), d = audio.duration || 0;
-    const start = ch ? ch.start : 0, end = ch ? Math.min(ch.end, d || ch.end) : d;
-    $("t-elapsed").textContent = clock((v / 1000) * (end - start));
+    $("t-elapsed").textContent = clock((v / 1000) * (audio.duration || 0));
   });
   $("seek").addEventListener("change", () => {
-    if (cur) {
-      const ch = chapterAt(cur.book, audio.currentTime), d = audio.duration || 0;
-      const start = ch ? ch.start : 0, end = ch ? Math.min(ch.end, d || ch.end) : d;
-      seekTo(start + (Number($("seek").value) / 1000) * (end - start));
-    }
+    if (cur && audio.duration) { audio.currentTime = (Number($("seek").value) / 1000) * audio.duration; updatePlayerUI(); }
     seeking = false;
   });
 
@@ -510,7 +598,7 @@
     if (!cur) return;
     const now = Date.now();
     if (now - lastPaint > 250) { lastPaint = now; if (!$("player").hidden || !$("mini").hidden) updatePlayerUI(); }
-    if (now - lastLocalSave > 5000) { lastLocalSave = now; setPos(cur.book.key, audio.currentTime); }
+    if (now - lastLocalSave > 5000) { lastLocalSave = now; setPos(cur.book.key, bookTime()); }
     if (now - lastPush > 60000 && tokenValid()) { lastPush = now; pushRemote().catch(() => {}); }
     checkSleep();
     if ("mediaSession" in navigator && navigator.mediaSession.setPositionState && audio.duration) {
@@ -519,42 +607,44 @@
   });
   audio.addEventListener("play", () => { updatePlayerUI(); if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing"; });
   audio.addEventListener("pause", () => {
-    if (cur) setPos(cur.book.key, audio.currentTime);
+    if (cur) setPos(cur.book.key, bookTime());
     updatePlayerUI(); pushSoon();
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
   });
-  audio.addEventListener("ended", () => {
+  audio.addEventListener("ended", async () => {
     if (!cur) return;
-    setPos(cur.book.key, 0, { done: true }); pushSoon();
-    toast(`You finished "${cur.book.info.title}"`, 4000); updatePlayerUI();
+    const b = cur.book, next = cur.i + 1;
+    if (S.sleep?.chapterEnd) { S.sleep = null; setPos(b.key, b.info.chapters[Math.min(next, b.info.chapters.length - 1)].start); updatePlayerUI(); return; }
+    if (next < b.info.chapters.length) {
+      setPos(b.key, b.info.chapters[next].start);
+      const ok = await loadChapter(b, next, 0, true);
+      if (!ok) updatePlayerUI();
+      return;
+    }
+    setPos(b.key, 0, { done: true }); pushSoon();
+    toast(`You finished "${b.info.title}"`, 4000); updatePlayerUI();
   });
 
   async function setMediaSession() {
     if (!("mediaSession" in navigator) || !cur) return;
     const url = await coverUrl(cur.book.key);
     navigator.mediaSession.metadata = new MediaMetadata({
-      title: cur.book.info.title, artist: authorOf(cur.book), album: "My Book Reader",
-      artwork: url ? [{ src: url, sizes: "600x600", type: "image/jpeg" }] : [{ src: "icon-512.png", sizes: "512x512", type: "image/png" }],
+      title: cur.book.info.chapters[cur.i].title, artist: authorOf(cur.book), album: cur.book.info.title,
+      artwork: url ? [{ src: url, sizes: "600x900", type: "image/jpeg" }] : [{ src: "icon-512.png", sizes: "512x512", type: "image/png" }],
     });
     const h = {
       play: () => play(), pause: () => audio.pause(),
-      seekbackward: () => seekTo(audio.currentTime - SKIP), seekforward: () => seekTo(audio.currentTime + SKIP),
+      seekbackward: () => seekBook(bookTime() - SKIP), seekforward: () => seekBook(bookTime() + SKIP),
       previoustrack: () => jumpChapter(-1), nexttrack: () => jumpChapter(1),
-      seekto: (e) => seekTo(e.seekTime),
+      seekto: (e) => { audio.currentTime = e.seekTime; updatePlayerUI(); },
     };
     for (const [k, fn] of Object.entries(h)) { try { navigator.mediaSession.setActionHandler(k, fn); } catch { /* unsupported */ } }
   }
 
   // Sleep timer
   function checkSleep() {
-    if (!S.sleep || audio.paused || !cur) return;
-    let fire = false;
-    if (S.sleep.until && Date.now() >= S.sleep.until) fire = true;
-    if (S.sleep.chapterEnd !== undefined && audio.currentTime >= S.sleep.chapterEnd - 0.3) fire = true;
-    if (fire) {
-      S.sleep = null;
-      fadeOutAndPause();
-    }
+    if (!S.sleep?.until || audio.paused || !cur) return;
+    if (Date.now() >= S.sleep.until) { S.sleep = null; fadeOutAndPause(); }
   }
   async function fadeOutAndPause() {
     const v0 = audio.volume;
@@ -567,7 +657,7 @@
       root.querySelectorAll("button").forEach((b) => (b.onclick = () => {
         const v = b.dataset.v;
         if (v === "0") S.sleep = null;
-        else if (v === "ch") { const c = cur && chapterAt(cur.book, audio.currentTime); S.sleep = c ? { chapterEnd: c.end } : null; }
+        else if (v === "ch") S.sleep = cur ? { chapterEnd: true } : null;
         else S.sleep = { until: Date.now() + Number(v) * 60000 };
         closeSheet(); updatePlayerUI();
         if (S.sleep) toast(v === "ch" ? "Pausing at the end of this chapter" : `Pausing in ${b.textContent.trim()}`);
@@ -584,24 +674,23 @@
   }
   function chaptersSheet() {
     if (!cur) return;
-    const chs = cur.book.info.chapters || [];
-    if (!chs.length) return toast("This book has no chapter list");
-    const now = chapterAt(cur.book, audio.currentTime);
+    const chs = cur.book.info.chapters;
     openSheet(`<h3>Chapters</h3><p class="sheet-sub">${chs.length} chapters</p><ul class="list">${chs.map((c, i) =>
-      `<li><button data-i="${i}" class="${i === now.i ? "current" : ""}"><span class="name">${esc(c.title)}</span><span class="meta">${clock(c.end - c.start)}</span></button></li>`).join("")}</ul>`, (root) => {
-      root.querySelectorAll("[data-i]").forEach((b) => (b.onclick = () => { seekTo(chs[Number(b.dataset.i)].start); closeSheet(); if (audio.paused) play(); }));
+      `<li><button data-i="${i}" class="${i === cur.i ? "current" : ""}"><span class="name">${esc(c.title)}</span><span class="meta">${clock(c.end - c.start)}</span></button></li>`).join("")}</ul>`, (root) => {
+      root.querySelectorAll("[data-i]").forEach((b) => (b.onclick = async () => { closeSheet(); await seekBook(chs[Number(b.dataset.i)].start + 0.01); if (audio.paused) play(); }));
       root.querySelector(".current")?.scrollIntoView({ block: "center" });
     });
   }
   async function settingsSheet() {
-    let used = "";
-    try { const e = await navigator.storage.estimate(); used = `${mb(e.usage)} used on this device`; } catch { /* ignore */ }
-    const t = S.settings.theme;
+    const used = Object.keys(S.local).reduce((n, k) => n + localBytes(k), 0);
+    const t = S.settings.theme, a = S.settings.ahead;
     openSheet(`<h3>Settings</h3>
       <div class="setting"><span>Appearance</span><span class="choice-row">${[["auto", "Auto"], ["dark", "Dark"], ["light", "Light"]].map(([v, l]) => `<button class="pill ${t === v ? "on" : ""}" data-theme="${v}">${l}</button>`).join("")}</span></div>
-      <div class="setting"><span>Downloads<br><span class="small muted">${used}</span></span><button class="pill" data-act="sync">Sync now</button></div>
+      <div class="setting" style="flex-wrap:wrap"><span>Keep saved for offline<br><span class="small muted">About 11 MB per hour</span></span><span class="choice-row">${[1, 3, 6, 12].map((h) => `<button class="pill ${a === h ? "on" : ""}" data-ahead="${h}">${h}h</button>`).join("")}</span></div>
+      <div class="setting"><span>On this device<br><span class="small muted">${used ? mb(used) || "Under 1 MB" : "Nothing saved yet"}</span></span><button class="pill" data-act="sync">Sync now</button></div>
       <div class="setting"><span>Google account<br><span class="small muted">${tokenValid() ? "Connected" : "Not connected right now"}</span></span><button class="pill" data-act="signout">Sign out</button></div>`, (root) => {
       root.querySelectorAll("[data-theme]").forEach((b) => (b.onclick = () => { S.settings.theme = b.dataset.theme; store.set("settings", S.settings); applyTheme(); settingsSheet(); }));
+      root.querySelectorAll("[data-ahead]").forEach((b) => (b.onclick = () => { S.settings.ahead = Number(b.dataset.ahead); store.set("settings", S.settings); keepAhead(); settingsSheet(); }));
       root.querySelector('[data-act="sync"]').onclick = () => { closeSheet(); manualSync(); };
       root.querySelector('[data-act="signout"]').onclick = () => {
         if (S.token && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(S.token, () => {});
@@ -609,7 +698,6 @@
       };
     });
   }
-
   // ---------- position sync through Drive's private app folder ----------
   async function pullRemote() {
     const f = await listAll("name='progress.json'", "id,modifiedTime", "appDataFolder");
@@ -645,7 +733,7 @@
         const l = S.progress[k];
         if (!l || (r.updated || 0) > (l.updated || 0)) {
           S.progress[k] = r;
-          if (cur?.book.key === k && audio.paused && !r.done && Math.abs(audio.currentTime - r.pos) > 3) { audio.currentTime = r.pos; moved = true; }
+          if (cur?.book.key === k && audio.paused && !r.done && Math.abs(bookTime() - r.pos) > 3) { seekBook(r.pos); moved = true; }
         }
       }
       saveProgress();
@@ -653,6 +741,7 @@
       await pushRemote();
       chip("Synced", false, true);
       renderContinue(); if ($("player").hidden) renderGrid(); else updatePlayerUI();
+      keepAhead();
     } catch (e) {
       chip(e instanceof AuthError ? "Tap to sync" : "Sync failed", true);
     } finally { syncing = false; }
@@ -666,17 +755,18 @@
   $("sync-status").onclick = () => { if ($("sync-status").classList.contains("warn")) manualSync(); };
 
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) { if (cur) setPos(cur.book.key, audio.currentTime); if (tokenValid() && navigator.onLine) pushRemote().catch(() => {}); }
+    if (document.hidden) { if (cur) setPos(cur.book.key, bookTime()); if (tokenValid() && navigator.onLine) pushRemote().catch(() => {}); }
     else if (store.get("signedIn")) syncNow({ quiet: true });
   });
   addEventListener("online", () => syncNow({ quiet: true }));
   addEventListener("offline", () => chip("Offline"));
-  addEventListener("pagehide", () => { if (cur) setPos(cur.book.key, audio.currentTime); });
+  addEventListener("pagehide", () => { if (cur) setPos(cur.book.key, bookTime()); });
+
 
   // ---------- wiring ----------
   $("play").onclick = toggle;
-  $("back").onclick = () => seekTo(audio.currentTime - SKIP);
-  $("fwd").onclick = () => seekTo(audio.currentTime + SKIP);
+  $("back").onclick = () => seekBook(bookTime() - SKIP);
+  $("fwd").onclick = () => seekBook(bookTime() + SKIP);
   $("prev-ch").onclick = () => jumpChapter(-1);
   $("next-ch").onclick = () => jumpChapter(1);
   $("speed-btn").onclick = speedSheet;
@@ -694,8 +784,8 @@
     if (e.target.matches("input")) return;
     if (e.key === "Escape") { if (!$("sheet").hidden) closeSheet(); else if (!$("player").hidden) closePlayer(); }
     if (e.code === "Space" && cur) { e.preventDefault(); toggle(); }
-    if (e.key === "ArrowLeft" && cur) seekTo(audio.currentTime - SKIP);
-    if (e.key === "ArrowRight" && cur) seekTo(audio.currentTime + SKIP);
+    if (e.key === "ArrowLeft" && cur) seekBook(bookTime() - SKIP);
+    if (e.key === "ArrowRight" && cur) seekBook(bookTime() + SKIP);
   });
   // The phone's back button closes the sheet or the player instead of leaving the app
   addEventListener("popstate", (e) => {
@@ -703,16 +793,29 @@
     else if (!$("player").hidden) closePlayer();
     else if (e.state?.o) history.back();
   });
+  addEventListener("online", () => keepAhead());
 
   // ---------- start ----------
   function showWelcome() {
     $("welcome").hidden = false; $("library").hidden = true; $("mini").hidden = true;
     if (!CFG.GOOGLE_CLIENT_ID || CFG.GOOGLE_CLIENT_ID.includes("PASTE")) $("welcome-note").textContent = "Setup is not finished: the Google Client ID still needs to go into config.js.";
   }
+  async function cleanOldDownloads() {
+    // Earlier versions saved whole books as single .m4b files. Remove them to free space.
+    try {
+      const root = await navigator.storage.getDirectory();
+      for await (const [name, h] of root.entries()) if (h.kind === "file" && name.endsWith(".m4b")) await root.removeEntry(name);
+    } catch { /* nothing to clean */ }
+    store.del("downloaded");
+  }
   async function showLibrary() {
     $("welcome").hidden = true; $("library").hidden = false;
     renderLibrary();
-    if (S.current && S.downloaded[S.current] && bookBy(S.current)) { await loadBook(S.current); }
+    const b = bookBy(S.current);
+    if (b && (b.info.chapters || []).length) {
+      const pos = S.progress[b.key]?.done ? 0 : (S.progress[b.key]?.pos || 0), i = chapterIndex(b, pos);
+      if (isLocal(b.key, b.info.chapters[i].file)) await loadChapter(b, i, pos - b.info.chapters[i].start, false);
+    }
   }
   $("signin").onclick = async () => {
     $("welcome-note").textContent = "";
@@ -729,6 +832,7 @@
   async function start() {
     applyTheme();
     if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+    if (store.get("downloaded")) cleanOldDownloads();
     if (!store.get("signedIn")) return showWelcome();
     await showLibrary();
     if (!navigator.onLine) return chip("Offline");
@@ -741,5 +845,5 @@
   start();
 
   // Exposed for testing only
-  window.__mbr = { S, syncNow, refreshLibrary, audio };
+  window.__mbr = { S, syncNow, refreshLibrary, keepAhead, audio, bookTime: () => bookTime(), cur: () => cur };
 })();
